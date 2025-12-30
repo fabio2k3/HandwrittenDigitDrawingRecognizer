@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 import torch
 import torch.nn.functional as F
 from torchvision import transforms, datasets
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset, Subset
 import matplotlib.pyplot as plt
 
 from model import DigitCNN
@@ -17,8 +17,8 @@ CANVAS_SIZE = 280
 IMAGE_SIZE = 28
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FEEDBACK_DIR = "data/user_feedback"
-MIN_SAMPLES_TO_TRAIN = 1  # mínimo para fine-tune rápido
 BATCH_SIZE = 8
+MNIST_SUBSET_SIZE = 1000  # subset de MNIST para fine-tune rápido
 
 # ================= MODEL =================
 model = DigitCNN().to(DEVICE)
@@ -73,18 +73,19 @@ def save_feedback(label):
 
 # ================= FINE-TUNING =================
 def fine_tune():
-    # Solo feedback para fine-tuning rápido
+    # Cargar subset MNIST
+    mnist_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+    mnist_indices = np.random.choice(len(mnist_dataset), MNIST_SUBSET_SIZE, replace=False)
+    subset_mnist = Subset(mnist_dataset, mnist_indices)
+
+    # Cargar feedback si existe
     if os.path.exists(FEEDBACK_DIR):
-        dataset = datasets.ImageFolder(FEEDBACK_DIR, transform=transform)
+        feedback_dataset = datasets.ImageFolder(FEEDBACK_DIR, transform=transform)
+        train_dataset = ConcatDataset([subset_mnist, feedback_dataset])
     else:
-        status_label.config(text="No feedback to train")
-        return
+        train_dataset = subset_mnist
 
-    if len(dataset) < MIN_SAMPLES_TO_TRAIN:
-        status_label.config(text="Not enough samples to retrain")
-        return
-
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = torch.nn.CrossEntropyLoss()
 
@@ -98,7 +99,7 @@ def fine_tune():
 
     model.eval()
     torch.save(model.state_dict(), "models/digit_cnn.pth")
-    status_label.config(text=f"Model updated with {len(dataset)} feedback samples")
+    status_label.config(text=f"Model updated with MNIST subset + feedback ({len(train_dataset)} samples)")
 
 # ================= GUI =================
 root = tk.Tk()
