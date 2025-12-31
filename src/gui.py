@@ -16,9 +16,12 @@ from model import DigitCNN
 CANVAS_SIZE = 280
 IMAGE_SIZE = 28
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 FEEDBACK_DIR = "data/user_feedback"
+MNIST_SUBSET_SIZE = 800
 BATCH_SIZE = 8
-MNIST_SUBSET_SIZE = 1000  # subset de MNIST para fine-tune rápido
+LR = 1e-3
+EPOCHS = 1
 
 # ================= MODEL =================
 model = DigitCNN().to(DEVICE)
@@ -55,9 +58,10 @@ def preprocess_pil(img):
     h, w = img.shape
     size = max(h, w)
     square = np.zeros((size, size), dtype=np.uint8)
-    square[(size-h)//2:(size-h)//2+h, (size-w)//2:(size-w)//2+w] = img
-    img = Image.fromarray(square).resize((IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS)
+    square[(size-h)//2:(size-h)//2+h,
+           (size-w)//2:(size-w)//2+w] = img
 
+    img = Image.fromarray(square).resize((IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS)
     last_processed_img = img
     return img
 
@@ -65,41 +69,47 @@ def preprocess_pil(img):
 def save_feedback(label):
     if last_processed_img is None:
         return
+
     path = os.path.join(FEEDBACK_DIR, str(label))
     os.makedirs(path, exist_ok=True)
-    filename = f"{int(time.time())}.png"
-    last_processed_img.save(os.path.join(path, filename))
+    last_processed_img.save(
+        os.path.join(path, f"{int(time.time())}.png")
+    )
     status_label.config(text=f"Saved correction as {label}")
 
 # ================= FINE-TUNING =================
 def fine_tune():
-    # Cargar subset MNIST
-    mnist_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-    mnist_indices = np.random.choice(len(mnist_dataset), MNIST_SUBSET_SIZE, replace=False)
-    subset_mnist = Subset(mnist_dataset, mnist_indices)
+    mnist = datasets.MNIST(
+        root="./data", train=True, download=True, transform=transform
+    )
 
-    # Cargar feedback si existe
+    idx = np.random.choice(len(mnist), MNIST_SUBSET_SIZE, replace=False)
+    mnist_subset = Subset(mnist, idx)
+
     if os.path.exists(FEEDBACK_DIR):
-        feedback_dataset = datasets.ImageFolder(FEEDBACK_DIR, transform=transform)
-        train_dataset = ConcatDataset([subset_mnist, feedback_dataset])
+        feedback = datasets.ImageFolder(FEEDBACK_DIR, transform=transform)
+        dataset = ConcatDataset([mnist_subset, feedback])
     else:
-        train_dataset = subset_mnist
+        dataset = mnist_subset
 
-    loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = torch.nn.CrossEntropyLoss()
 
     model.train()
-    for imgs, labels in loader:
-        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-        optimizer.zero_grad()
-        loss = criterion(model(imgs), labels)
-        loss.backward()
-        optimizer.step()
+    for _ in range(EPOCHS):
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(model(imgs), labels)
+            loss.backward()
+            optimizer.step()
 
     model.eval()
     torch.save(model.state_dict(), "models/digit_cnn.pth")
-    status_label.config(text=f"Model updated with MNIST subset + feedback ({len(train_dataset)} samples)")
+    status_label.config(
+        text=f"Model updated ({len(dataset)} samples)"
+    )
 
 # ================= GUI =================
 root = tk.Tk()
@@ -111,7 +121,6 @@ canvas.pack()
 image = Image.new("L", (CANVAS_SIZE, CANVAS_SIZE), 0)
 draw = ImageDraw.Draw(image)
 
-# ================= DRAW =================
 def paint(event):
     r = 8
     x1, y1 = event.x - r, event.y - r
@@ -128,50 +137,45 @@ def predict():
     if img is None:
         return
 
-    img_tensor = transform(img).unsqueeze(0).to(DEVICE)
-
+    x = transform(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        logits = model(img_tensor)
-        probs = F.softmax(logits, dim=1).cpu().numpy().flatten()
-        pred = np.argmax(probs)
+        probs = F.softmax(model(x), dim=1).cpu().numpy()[0]
 
+    pred = probs.argmax()
     result_label.config(
         text=f"Prediction: {pred} ({probs[pred]*100:.2f}%)"
     )
 
-    # Cerrar figura anterior si existe
-    if prob_fig is not None:
+    if prob_fig:
         plt.close(prob_fig)
 
     prob_fig = plt.figure(figsize=(6,3))
-    plt.bar(range(10), probs, color='blue')
+    plt.bar(range(10), probs)
     plt.xticks(range(10))
-    plt.ylabel("Probability")
-    plt.title("Class Probabilities")
+    plt.title("Probabilities")
     plt.show()
 
 # ================= CLEAR =================
 def clear():
     global prob_fig
     canvas.delete("all")
-    draw.rectangle([0, 0, CANVAS_SIZE, CANVAS_SIZE], fill=0)
+    draw.rectangle([0,0,CANVAS_SIZE,CANVAS_SIZE], fill=0)
     result_label.config(text="Draw a digit")
-    if prob_fig is not None:
+    if prob_fig:
         plt.close(prob_fig)
         prob_fig = None
 
 # ================= BUTTONS =================
-btn_frame = tk.Frame(root)
-btn_frame.pack()
+frame = tk.Frame(root)
+frame.pack()
 
-tk.Button(btn_frame, text="Predict", command=predict, width=10).pack(side=tk.LEFT)
-tk.Button(btn_frame, text="Clear", command=clear, width=10).pack(side=tk.LEFT)
+tk.Button(frame, text="Predict", command=predict).pack(side=tk.LEFT)
+tk.Button(frame, text="Clear", command=clear).pack(side=tk.LEFT)
 
-# Fine-tuning en hilo separado
-def run_fine_tune():
+def run_update():
     threading.Thread(target=fine_tune).start()
 
-tk.Button(btn_frame, text="Update Model", command=run_fine_tune, width=12).pack(side=tk.LEFT)
+tk.Button(frame, text="Update Model", command=run_update).pack(side=tk.LEFT)
 
 result_label = tk.Label(root, text="Draw a digit", font=("Arial", 18))
 result_label.pack()
@@ -179,17 +183,10 @@ result_label.pack()
 status_label = tk.Label(root, text="", font=("Arial", 10))
 status_label.pack()
 
-# ================= CORRECTION BUTTONS =================
-corr_frame = tk.Frame(root)
-corr_frame.pack()
-
-tk.Label(corr_frame, text="Correction:").pack(side=tk.LEFT)
+corr = tk.Frame(root)
+corr.pack()
+tk.Label(corr, text="Correction:").pack(side=tk.LEFT)
 for i in range(10):
-    tk.Button(
-        corr_frame,
-        text=str(i),
-        command=lambda x=i: save_feedback(x),
-        width=2
-    ).pack(side=tk.LEFT)
+    tk.Button(corr, text=str(i), command=lambda x=i: save_feedback(x)).pack(side=tk.LEFT)
 
 root.mainloop()
